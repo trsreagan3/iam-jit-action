@@ -154,15 +154,19 @@ runs:
         IFS=',' read -ra BOUNCERS <<< "$bouncers_input"
 
         # ibounce is a Python entry-point (ships inside the iam-jit pip package).
-        # It is already available after step 4 (Install iam-jit) — no separate
-        # go install required.
-        #
+        # It is already available after step 4 (Install iam-jit) — no go install.
         # kbouncer, dbounce, gbounce are Go binaries installed via go install.
-        declare -A GO_BOUNCER_PKG=(
-          ["kbouncer"]="github.com/trsreagan3/kbouncer/cmd/kbouncer@latest"
-          ["dbounce"]="github.com/trsreagan3/dbounce/cmd/dbounce@latest"
-          ["gbounce"]="github.com/trsreagan3/gbounce/cmd/gbounce@latest"
-        )
+        #
+        # Note: declare -A (associative arrays) requires bash 4+; macOS ships
+        # bash 3.2. Use a case statement instead for cross-platform compat.
+        go_pkg_for_bouncer() {
+          case "$1" in
+            kbouncer) echo "github.com/trsreagan3/kbouncer/cmd/kbouncer@latest" ;;
+            dbounce)  echo "github.com/trsreagan3/dbounce/cmd/dbounce@latest"   ;;
+            gbounce)  echo "github.com/trsreagan3/gbounce/cmd/gbounce@latest"   ;;
+            *)        echo "" ;;
+          esac
+        }
 
         failed_bouncers=()
         for bouncer in "${BOUNCERS[@]}"; do
@@ -181,7 +185,7 @@ runs:
             continue
           fi
 
-          pkg="${GO_BOUNCER_PKG[$bouncer]:-}"
+          pkg="$(go_pkg_for_bouncer "$bouncer")"
           if [ -z "$pkg" ]; then
             echo "::warning::Unknown bouncer '$bouncer'. Valid: ibounce, kbouncer, dbounce, gbounce."
             continue
