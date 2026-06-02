@@ -121,7 +121,13 @@ runs:
         fi
 
         echo "Installing $pip_spec ..."
-        pip install --quiet "$pip_spec"
+        # Try PyPI first; fall back to GitHub source when not yet published.
+        if ! pip install --quiet "$pip_spec" 2>/dev/null; then
+          echo "PyPI install failed (package may not be published yet). " \
+               "Falling back to GitHub source install ..."
+          pip install --quiet \
+            "git+https://github.com/trsreagan3/iam-jit.git@main#egg=iam-jit"
+        fi
 
         # Fail loud if install did not land a binary on PATH.
         if ! command -v iam-jit &>/dev/null; then
@@ -147,20 +153,39 @@ runs:
 
         IFS=',' read -ra BOUNCERS <<< "$bouncers_input"
 
-        # Map bouncer name → go install path.
-        declare -A BOUNCER_PKG=(
-          ["ibounce"]="github.com/trsreagan3/iam-roles/cmd/ibounce@latest"
-          ["kbouncer"]="github.com/trsreagan3/kbouncer/cmd/kbouncer@latest"
-          ["dbounce"]="github.com/trsreagan3/dbounce/cmd/dbounce@latest"
-          ["gbounce"]="github.com/trsreagan3/gbounce/cmd/gbounce@latest"
-        )
+        # ibounce is a Python entry-point (ships inside the iam-jit pip package).
+        # It is already available after step 4 (Install iam-jit) — no go install.
+        # kbouncer, dbounce, gbounce are Go binaries installed via go install.
+        #
+        # Note: declare -A (associative arrays) requires bash 4+; macOS ships
+        # bash 3.2. Use a case statement instead for cross-platform compat.
+        go_pkg_for_bouncer() {
+          case "$1" in
+            kbouncer) echo "github.com/trsreagan3/kbouncer/cmd/kbouncer@latest" ;;
+            dbounce)  echo "github.com/trsreagan3/dbounce/cmd/dbounce@latest"   ;;
+            gbounce)  echo "github.com/trsreagan3/gbounce/cmd/gbounce@latest"   ;;
+            *)        echo "" ;;
+          esac
+        }
 
         failed_bouncers=()
         for bouncer in "${BOUNCERS[@]}"; do
           bouncer="$(echo "$bouncer" | tr -d ' ')"
           [ -z "$bouncer" ] && continue
 
-          pkg="${BOUNCER_PKG[$bouncer]}"
+          if [ "$bouncer" = "ibounce" ]; then
+            # ibounce ships with iam-jit pip package — already installed.
+            if command -v ibounce &>/dev/null; then
+              echo "  ibounce already on PATH (installed via iam-jit pip package)."
+            else
+              echo "::warning::ibounce not found on PATH after pip install. " \
+                   "It should have been installed as part of iam-jit."
+              failed_bouncers+=("ibounce")
+            fi
+            continue
+          fi
+
+          pkg="$(go_pkg_for_bouncer "$bouncer")"
           if [ -z "$pkg" ]; then
             echo "::warning::Unknown bouncer '$bouncer'. Valid: ibounce, kbouncer, dbounce, gbounce."
             continue
