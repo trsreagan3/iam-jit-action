@@ -1,0 +1,262 @@
+name: 'IAM JIT — Install + Bouncer Wire-up'
+description: |
+  One-step CI install of iam-jit + the Bounce-suite bouncers (ibounce,
+  kbouncer, dbounce, gbounce). Routes agent AWS calls + HTTPS through
+  the bouncers, exports env vars for subsequent steps, and outputs the
+  audit-log path and initial decisions baseline so tests can assert
+  decisions_count ticked after real traffic.
+
+  Linux + macOS runners. Windows: v1.1 gap (document only).
+author: 'trsreagan3'
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+# ── Inputs ────────────────────────────────────────────────────────────────────
+inputs:
+  version:
+    description: |
+      iam-jit version to install via pip. Use 'latest' to pull the most
+      recent release from PyPI, or pin to a specific version (e.g. '1.0.3').
+    required: false
+    default: 'latest'
+
+  bouncers:
+    description: |
+      Comma-separated list of bouncers to install and start.
+      Valid values: ibounce, kbouncer, dbounce, gbounce.
+      Set to 'none' to skip bouncer install entirely (iam-jit CLI only).
+    required: false
+    default: 'ibounce,kbouncer,dbounce,gbounce'
+
+  harness:
+    description: |
+      Agent harness to wire iam-jit into. Controls which env vars and
+      config files are written.
+        - claude-code   Write to ~/.claude/settings.json + ~/.claude.json
+        - cursor        Write to ~/.cursor/mcp.json
+        - codex         Print snippet (no auto-write; codex path is unstable)
+        - none          Skip harness wiring (env vars exported for manual use)
+    required: false
+    default: 'claude-code'
+
+  mode:
+    description: |
+      Bouncer enforcement mode per [[discovery-first-default]]:
+        - discovery    Observe + log only, no deny (safe for CI runs)
+        - cooperative  Agent sees deny rationale and may retry scoped
+        - strict       Maximalist deny + alert; no retry loop
+    required: false
+    default: 'cooperative'
+
+  audit-log-path:
+    description: |
+      File path where the audit JSONL log is written. Exported to
+      $GITHUB_ENV as IAM_JIT_AUDIT_LOG so subsequent steps can query it.
+    required: false
+    default: ''
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+outputs:
+  bouncer-port:
+    description: |
+      Port ibounce is listening on (default 8767). Useful for curl
+      health-checks or wiring AWS_ENDPOINT_URL in downstream steps.
+    value: ${{ steps.start-bouncers.outputs.bouncer_port }}
+
+  audit-log-path:
+    description: 'Resolved audit JSONL log path (matches IAM_JIT_AUDIT_LOG env var).'
+    value: ${{ steps.start-bouncers.outputs.audit_log_path }}
+
+  decisions-count-baseline:
+    description: |
+      decisions_count from ibounce /healthz immediately after start.
+      Compare against a later probe to assert the bouncer saw real traffic.
+    value: ${{ steps.start-bouncers.outputs.decisions_count_baseline }}
+
+# ── Steps ─────────────────────────────────────────────────────────────────────
+runs:
+  using: 'composite'
+  steps:
+    # ── 1. Detect runner OS ─────────────────────────────────────────────────
+    - name: Detect runner OS
+      id: detect-os
+      shell: bash
+      run: |
+        os="$(uname -s)"
+        case "$os" in
+          Linux)  echo "runner_os=linux"  >> "$GITHUB_OUTPUT" ;;
+          Darwin) echo "runner_os=macos"  >> "$GITHUB_OUTPUT" ;;
+          *)
+            echo "::error::Unsupported runner OS: $os. " \
+                 "iam-jit-action supports Linux + macOS. " \
+                 "Windows support is planned for v1.1."
+            exit 1
+            ;;
+        esac
+        echo "Detected runner OS: $os"
+
+    # ── 2. Set up Python (no sudo needed) ───────────────────────────────────
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    # ── 3. Set up Go (for Go-backed bouncers) ───────────────────────────────
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
+    # ── 4. Install iam-jit via pip ──────────────────────────────────────────
+    - name: Install iam-jit
+      id: install-iam-jit
+      shell: bash
+      run: |
+        version="${{ inputs.version }}"
+        if [ "$version" = "latest" ]; then
+          pip_spec="iam-jit"
+        else
+          pip_spec="iam-jit==${version}"
+        fi
+
+        echo "Installing $pip_spec ..."
+        pip install --quiet "$pip_spec"
+
+        # Fail loud if install did not land a binary on PATH.
+        if ! command -v iam-jit &>/dev/null; then
+          echo "::error::iam-jit install failed: binary not found on PATH after pip install. " \
+               "Check that the package name is correct and pip's bin dir is on PATH."
+          exit 1
+        fi
+
+        installed_version="$(iam-jit --version 2>/dev/null || echo unknown)"
+        echo "iam-jit installed: $installed_version"
+        echo "iam_jit_version=$installed_version" >> "$GITHUB_OUTPUT"
+
+    # ── 5. Install Go-backed bouncers ───────────────────────────────────────
+    - name: Install Go-backed bouncers
+      id: install-bouncers
+      shell: bash
+      run: |
+        bouncers_input="${{ inputs.bouncers }}"
+        if [ "$bouncers_input" = "none" ]; then
+          echo "Bouncer install skipped (bouncers=none)."
+          exit 0
+        fi
+
+        IFS=',' read -ra BOUNCERS <<< "$bouncers_input"
+
+        # Map bouncer name → go install path.
+        declare -A BOUNCER_PKG=(
+          ["ibounce"]="github.com/trsreagan3/iam-roles/cmd/ibounce@latest"
+          ["kbouncer"]="github.com/trsreagan3/kbouncer/cmd/kbouncer@latest"
+          ["dbounce"]="github.com/trsreagan3/dbounce/cmd/dbounce@latest"
+          ["gbounce"]="github.com/trsreagan3/gbounce/cmd/gbounce@latest"
+        )
+
+        failed_bouncers=()
+        for bouncer in "${BOUNCERS[@]}"; do
+          bouncer="$(echo "$bouncer" | tr -d ' ')"
+          [ -z "$bouncer" ] && continue
+
+          pkg="${BOUNCER_PKG[$bouncer]}"
+          if [ -z "$pkg" ]; then
+            echo "::warning::Unknown bouncer '$bouncer'. Valid: ibounce, kbouncer, dbounce, gbounce."
+            continue
+          fi
+
+          echo "Installing $bouncer from $pkg ..."
+          if go install "$pkg" 2>&1; then
+            echo "  $bouncer installed OK."
+          else
+            echo "::warning::go install $pkg failed. Bouncer '$bouncer' will be skipped."
+            failed_bouncers+=("$bouncer")
+          fi
+        done
+
+        if [ ${#failed_bouncers[@]} -gt 0 ]; then
+          echo "::warning::Some bouncers failed to install: ${failed_bouncers[*]}. " \
+               "Remaining bouncers will still start."
+        fi
+
+    # ── 6. Run iam-jit init ──────────────────────────────────────────────────
+    - name: Run iam-jit init
+      id: iam-jit-init
+      shell: bash
+      run: |
+        harness="${{ inputs.harness }}"
+        mode="${{ inputs.mode }}"
+        bouncers_input="${{ inputs.bouncers }}"
+
+        if [ "$bouncers_input" = "none" ]; then
+          bouncer_arg="ibounce"  # init needs at least one; will be skipped at start
+        else
+          bouncer_arg="$bouncers_input"
+        fi
+
+        echo "Running iam-jit init (harness=$harness mode=$mode bouncers=$bouncer_arg) ..."
+        iam-jit init \
+          --non-interactive \
+          --harness="$harness" \
+          --mode="$mode" \
+          --bouncers="$bouncer_arg" \
+          --shape=local-solo \
+          --skip-mcp-install \
+          --no-doctor-check \
+          --overwrite \
+          2>&1 || {
+            rc=$?
+            echo "::error::iam-jit init exited $rc. " \
+                 "See above for details. Install is aborted."
+            exit $rc
+          }
+
+        echo "iam-jit init completed."
+
+    # ── 7. Start bouncers + export env vars ─────────────────────────────────
+    - name: Start bouncers and export env vars
+      id: start-bouncers
+      shell: bash
+      run: |
+        "${{ github.action_path }}/scripts/start-bouncers.sh"
+      env:
+        IAM_JIT_BOUNCERS: ${{ inputs.bouncers }}
+        IAM_JIT_MODE: ${{ inputs.mode }}
+        IAM_JIT_AUDIT_LOG_INPUT: ${{ inputs.audit-log-path }}
+        RUNNER_TEMP: ${{ runner.temp }}
+
+    # ── 8. Verify at least ibounce is up (fail loud) ─────────────────────────
+    - name: Verify bouncer health
+      shell: bash
+      run: |
+        bouncers_input="${{ inputs.bouncers }}"
+        if [ "$bouncers_input" = "none" ]; then
+          echo "Bouncer start skipped (bouncers=none). Health check skipped."
+          exit 0
+        fi
+
+        # ibounce is the primary gating bouncer; require it unless explicitly
+        # excluded from the bouncers list.
+        if echo "$bouncers_input" | grep -qw "ibounce"; then
+          port="$IBOUNCE_PORT"
+          max_wait=15
+          waited=0
+          while [ $waited -lt $max_wait ]; do
+            if curl -sf "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+              echo "ibounce is up on :${port}."
+              break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+          done
+          if [ $waited -ge $max_wait ]; then
+            echo "::error::ibounce did not respond on :${port} within ${max_wait}s. " \
+                 "Install FAILED — not protecting. Check ibounce logs at " \
+                 "\$RUNNER_TEMP/ibounce.log for details."
+            cat "${RUNNER_TEMP}/ibounce.log" 2>/dev/null || true
+            exit 1
+          fi
+        fi
+
+        echo "Bouncer health check passed."

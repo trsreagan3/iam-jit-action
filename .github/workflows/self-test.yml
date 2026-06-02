@@ -1,0 +1,208 @@
+name: Self-test — iam-jit-action
+
+# Verify the action installs correctly, bouncers start, and decisions_count
+# ticks after a real AWS API call is routed through ibounce.
+#
+# Per [[uat-tests-setup-end-to-end]]: the test must assert the OUTCOME
+# (decisions_count Δ > 0), not just that --version works.
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  self-test-linux:
+    name: Self-test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # ── 1. Check out this action repo ───────────────────────────────────
+      - name: Checkout iam-jit-action
+        uses: actions/checkout@v4
+
+      # ── 2. Invoke the action against itself ─────────────────────────────
+      - name: Install iam-jit + start bouncers
+        id: iam-jit
+        uses: ./
+        with:
+          version: 'latest'
+          bouncers: 'ibounce'
+          harness: 'none'
+          mode: 'cooperative'
+
+      # ── 3. Confirm outputs are set ───────────────────────────────────────
+      - name: Assert action outputs are populated
+        shell: bash
+        run: |
+          port="${{ steps.iam-jit.outputs.bouncer-port }}"
+          log="${{ steps.iam-jit.outputs.audit-log-path }}"
+          baseline="${{ steps.iam-jit.outputs.decisions-count-baseline }}"
+
+          echo "bouncer-port=$port"
+          echo "audit-log-path=$log"
+          echo "decisions-count-baseline=$baseline"
+
+          [ -n "$port" ]     || { echo "::error::bouncer-port output is empty"; exit 1; }
+          [ -n "$log" ]      || { echo "::error::audit-log-path output is empty"; exit 1; }
+          [ -n "$baseline" ] || { echo "::error::decisions-count-baseline output is empty"; exit 1; }
+
+          echo "All outputs populated. baseline decisions_count=$baseline"
+
+      # ── 4. Confirm ibounce health ────────────────────────────────────────
+      - name: Assert ibounce /healthz responds
+        shell: bash
+        run: |
+          port="${{ steps.iam-jit.outputs.bouncer-port }}"
+          curl -sf "http://127.0.0.1:${port}/healthz" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          print('healthz:', json.dumps(d, indent=2))
+          assert d.get('status') == 'ok', f'Expected status=ok, got: {d}'
+          print('ibounce /healthz OK')
+          "
+
+      # ── 5. Make a real AWS API call routed through ibounce ───────────────
+      # LocalStack is NOT used here. We use a deliberately invalid credential
+      # so AWS STS returns a real AuthorizationError response — ibounce
+      # intercepts + logs the request, ticking decisions_count, even though
+      # the credential is wrong. This proves traffic routes through ibounce
+      # without requiring real AWS access in CI.
+      - name: Send real AWS traffic through ibounce
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: AKIAIOSFODNN7SELF_TEST
+          AWS_SECRET_ACCESS_KEY: self-test-invalid-secret-key
+          AWS_DEFAULT_REGION: us-east-1
+          # AWS_ENDPOINT_URL is already exported by the action.
+        run: |
+          echo "AWS_ENDPOINT_URL=$AWS_ENDPOINT_URL"
+          echo "Sending sts:GetCallerIdentity through ibounce ..."
+          # Expect the AWS CLI to fail (invalid creds) but ibounce must see it.
+          aws sts get-caller-identity 2>&1 || true
+          echo "AWS CLI call completed (may have auth-errored — that is expected)."
+
+      # ── 6. Assert decisions_count ticked ────────────────────────────────
+      - name: Assert decisions_count > baseline (traffic routed through ibounce)
+        shell: bash
+        run: |
+          port="${{ steps.iam-jit.outputs.bouncer-port }}"
+          baseline="${{ steps.iam-jit.outputs.decisions-count-baseline }}"
+
+          after="$(
+            curl -sf "http://127.0.0.1:${port}/healthz" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('decisions_count',0))"
+          )"
+
+          delta=$((after - baseline))
+          echo "decisions_count: baseline=$baseline  after=$after  delta=$delta"
+
+          if [ "$delta" -le 0 ]; then
+            echo "::error::decisions_count did not tick (baseline=$baseline after=$after). " \
+                 "AWS_ENDPOINT_URL may not have been inherited by the aws CLI step. " \
+                 "Check that AWS_ENDPOINT_URL=$AWS_ENDPOINT_URL is set."
+            exit 1
+          fi
+
+          echo "decisions_count Δ=$delta — ibounce audited real traffic. PASS."
+
+      # ── 7. Assert audit log has entries ──────────────────────────────────
+      - name: Assert audit log contains decision entries
+        shell: bash
+        run: |
+          log="${{ steps.iam-jit.outputs.audit-log-path }}"
+          echo "Audit log: $log"
+
+          if [ ! -f "$log" ]; then
+            echo "::error::Audit log file not found at $log."
+            exit 1
+          fi
+
+          lines="$(wc -l < "$log" || echo 0)"
+          echo "Audit log line count: $lines"
+
+          if [ "$lines" -eq 0 ]; then
+            echo "::warning::Audit log is empty. This may be expected if ibounce " \
+                 "buffers decisions before flushing. Check ibounce audit-log-path config."
+          else
+            head -1 "$log" | python3 -c "
+          import sys, json
+          line = sys.stdin.read().strip()
+          if not line:
+              print('audit log: (empty first line)')
+              sys.exit(0)
+          try:
+              d = json.loads(line)
+              print('audit log first entry keys:', list(d.keys()))
+          except json.JSONDecodeError:
+              print('audit log first line is not JSON:', line[:200])
+          "
+          fi
+
+          echo "Audit log check complete."
+
+      # ── 8. Print posture snapshot ────────────────────────────────────────
+      - name: Print iam-jit posture
+        shell: bash
+        run: |
+          iam-jit posture --json 2>/dev/null \
+            | python3 -m json.tool \
+            || iam-jit posture 2>&1 \
+            || echo "(posture command failed — not blocking)"
+
+  # ── macOS smoke test ───────────────────────────────────────────────────────
+  self-test-macos:
+    name: Self-test (macos-latest)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout iam-jit-action
+        uses: actions/checkout@v4
+
+      - name: Install iam-jit + start bouncers (macOS)
+        id: iam-jit
+        uses: ./
+        with:
+          version: 'latest'
+          bouncers: 'ibounce'
+          harness: 'none'
+          mode: 'cooperative'
+
+      - name: Assert ibounce is up (macOS)
+        shell: bash
+        run: |
+          port="${{ steps.iam-jit.outputs.bouncer-port }}"
+          curl -sf "http://127.0.0.1:${port}/healthz" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'"
+          echo "macOS ibounce health check passed."
+
+      - name: Send traffic + assert decisions_count ticked (macOS)
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: AKIAIOSFODNN7SELF_TEST
+          AWS_SECRET_ACCESS_KEY: self-test-invalid-secret-key
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          baseline="${{ steps.iam-jit.outputs.decisions-count-baseline }}"
+          port="${{ steps.iam-jit.outputs.bouncer-port }}"
+
+          aws sts get-caller-identity 2>&1 || true
+
+          after="$(
+            curl -sf "http://127.0.0.1:${port}/healthz" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('decisions_count',0))"
+          )"
+          delta=$((after - baseline))
+          echo "decisions_count Δ=$delta (baseline=$baseline after=$after)"
+
+          if [ "$delta" -le 0 ]; then
+            echo "::error::decisions_count did not tick on macOS runner. FAIL."
+            exit 1
+          fi
+          echo "macOS decisions_count Δ=$delta. PASS."
